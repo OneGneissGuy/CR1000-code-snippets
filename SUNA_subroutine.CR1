@@ -1,6 +1,7 @@
 'CR1000 Series Datalogger
 'Program SUNA_Subroutine.cr1
-'This program turns on a SUNA and inistiates a measurement cycle and shuts it down every 15 minutes
+'This program turns on a SUNA and initiates a measurement cycle and shuts it down at a prescribed interval
+'(every 15 minutes)
 'date:4/24/15
 'program author:John F Saraceno and others
 'saraceno@usgs.gov
