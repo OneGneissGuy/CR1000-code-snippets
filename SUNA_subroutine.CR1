@@ -1,0 +1,313 @@
+'CR1000 Series Datalogger
+'Program SUNA_Subroutine.cr1
+'This program turns on a SUNA and inistiates a measurement cycle and shuts it down every 15 minutes
+'date:4/24/15
+'program author:John F Saraceno and others
+'saraceno@usgs.gov
+'======================================================================================================
+'USGS Software Disclaimer:
+'The software was developed by the U.S. Geological Survey (USGS) for use by the USGS in fulfilling its mission.
+'    The software can be used, copied, modified, AND distributed without any fee OR cost.
+'     Use of appropriate credit Is requested. The software Is provided As a Minimum in source code form As used on USGS computers.
+'
+'
+'The USGS provides no warranty, expressed OR implied, As To the correctness of the furnished software OR the suitability For any purpose.
+' The software has been tested, but As with any complex software, there could be undetected errors.
+' Users who find errors are requested To report them To the USGS (code author).
+' The USGS has limited resources To assist non-USGS users; however, we make an attempt To FIX reported problems AND help whenever possible.
+
+' See http://www.usgs.gov/laws/policies_notices.html for more information
+'======================================================================================================
+'
+
+'Wiring is assumed to be as follows:
+'SUNA:
+'power
+'Power in --> SW12 port
+'Power Return Is wired To G
+'comms
+'TX line Is wired To C6
+'RX line Is wired To c5
+'Signal reference To G
+'shield to ---|||
+'Declare Public Variables
+
+'To write spectra, this subroutine assumes there is a CF card on the CR1000 in a NL115 or CFM 100 or similair
+Public PTemp, batt_volt
+
+Const SampleInterval = 15 'min
+Sub SUNA(dest(17),Quality As Long, ComPort,SUNAVersion As Long,DiagFileName As String * 64)
+
+  'This sub has the following dependencies
+  ' Process: Execute SerialOpen() for specified ComPort before calling
+  ' Process: Sensor must be powered up long enough before calling
+  ' Constants: SUNA_MEASNUM, SUNA_AVGNUM, NO3_CV_LOW, NO3_CV_HIGH,
+  '     NO3_LOW_HARD, NO3_LOW_SOFT, NO3_HIGH_HARD, NO3_HIGH_SOFT, NO3_FIT_HIGH
+
+  Const Port3_SampleMode = "POLLED"
+  Const Port3_Mode = "SUNAv2"
+  Const Port3_ComPort =  Com3
+  Const Port3_delay = 500 'ms between successive frames
+  Const Port3_start_delay = 100'sec to turn on and receive "Measure" command and start txmt data
+  Const SUNA_MEASNUM=30'to be accummualted and stored or averaged
+  Const SUNA_AVGNUM=20'to be averaged
+  Const SUNA_OFFSET=0 'offset concentration
+
+  'used to control max array size
+  Const SUNAMaxFrameLen = 282
+
+  Dim SUNAInString As String * 2000
+  Dim NBytesReturned As Long
+  Dim SunaInVals(SUNAMaxFrameLen)
+
+  'TODO: Note, can save on memory by removing this if not actually needed
+  Dim SunaVector(SUNA_MEASNUM,SUNAMaxFrameLen)
+
+  Dim NO3_SampleTime(SUNA_MEASNUM)
+  Dim NO3_dark(SUNA_MEASNUM)
+  Dim NO3_SN, NO3(SUNA_MEASNUM), no3_a254(SUNA_MEASNUM)
+  Dim no3_a350(SUNA_MEASNUM), NO3_light(SUNA_MEASNUM),Spec_Temp(SUNA_MEASNUM)
+  Dim Lamp_temp(SUNA_MEASNUM), Lamp_Time(SUNA_MEASNUM), RH(SUNA_MEASNUM)
+  Dim InputVDC(SUNA_MEASNUM), LampVDC(SUNA_MEASNUM), NO3_fit(SUNA_MEASNUM)
+  Dim NO3_ave, NO3_fit_ave, NO3_stdev, NO3_fit_stdev, NO3_med, NO3_fit_med, NO3_CV
+  Dim NO3_mean2med
+  Dim NO3_sort(SUNA_AVGNUM),NO3_fit_sort(SUNA_AVGNUM)
+  Dim t,j,z
+  Dim FileHandle As Long
+
+  Dim StartCmd As String * 12
+  Dim StopCmd As String * 4
+  Dim CmdChar As String * 3
+  Dim FrameLen As Long
+
+  Public NO3_CV_LOW,NO3_CV_HIGH,NO3_LOW_HARD,NO3_LOW_SOFT,NO3_HIGH_SOFT,NO3_HIGH_HARD,NO3_FIT_HIGH
+  Public NO3_flag As Boolean,NO3_softFlag As Boolean, BadNO3Cnt
+
+  Public Port3_SUNA_data(17)
+  Alias Port3_SUNA_data(1) =  NO3_ave
+  Alias Port3_SUNA_data(2) = NO3_stdev
+  Alias Port3_SUNA_data(3) = NO3_med
+  Alias Port3_SUNA_data(4) = NO3_fit_ave
+  Alias Port3_SUNA_data(5) = NO3_fit_stdev
+  Alias Port3_SUNA_data(6) = NO3_fit_med
+  Alias Port3_SUNA_data(7) = no3_a254
+  Alias Port3_SUNA_data(8) = no3_a350
+  Alias Port3_SUNA_data(9) = NO3_dark
+  Alias Port3_SUNA_data(10) = NO3_light
+  Alias Port3_SUNA_data(11) = Spec_Temp
+  Alias Port3_SUNA_data(12) = Lamp_temp
+  Alias Port3_SUNA_data(13) = Lamp_Time
+  Alias Port3_SUNA_data(14) = RH
+  Alias Port3_SUNA_data(15) = LampVDC
+  Alias Port3_SUNA_data(16) = InputVDC
+  Alias Port3_SUNA_data(17) = NO3_SN
+  Public Port3_SUNA_Quality
+  'SUNA version 1 and SUNA version 2 have different
+  'start commands and different "frame lengths"
+  Select Case SUNAVersion
+  Case 1
+    StartCmd = "MEASURE " & SUNA_MEASNUM
+    'StartCmd = "STRT"
+    FrameLen = 241
+    StopCmd = "STOP"
+    CmdChar = "$"
+  Case 2
+    StartCmd = "MEASURE " & SUNA_MEASNUM
+    'StartCmd = "START"
+    FrameLen = 282
+    StopCmd = "STOP"
+    CmdChar = "$"
+  EndSelect
+
+  'issue EXIT and then STOP to make sure we are in a known state
+  'i.e., out of SUNA> and ideally back at CMD?
+  'then delay and flush out anything in the buffer
+  If UpperCase(Port3_SampleMode) = "POLLED"
+    SerialOut(ComPort,"EXIT" & CHR(13) & CHR(10),"",1,1)
+    SerialOut(ComPort,"STOP" & CHR(13) & CHR(10),"",1,1)
+    Delay (1,1,Sec)
+    SerialFlush (ComPort)
+
+    'CR and LF until the sensor is awake and/or
+    'we are at the CMD? prompt
+    'then ask for "X" num measurements
+    SerialOut (ComPort, CHR(13) + CHR(10),"CMD?",3,500)
+    SerialOut(ComPort,StartCmd & CHR(13) & CHR(10),"",1,1)
+  EndIf
+  'intialize data vectors as NAN's to start
+  SunaInVals() = NAN
+  SunaVector() = NAN
+  '... and all the others
+
+  'wait for all the data to come in
+  z = 1
+  For t = 1 To (300 + (SUNA_MEASNUM * 3))
+
+    'every delay milliseconds, look for a string
+    'that starts with "SA" and ends with CRLF
+    Delay (1,Port3_delay,mSec)
+    SerialInRecord (ComPort,SUNAInString,&h5341,0,&H0D0A,NBytesReturned,11)
+
+    'if we found something of interest, tack the "SA"
+    'back on to the front and process
+    If NBytesReturned <> 0 Then
+      SUNAInString = "SA" & SUNAInString
+
+      'if a file name has been provided, write the "SA"..<CR>
+      'data captured to a text file
+      'this is less efficient than parsing out the numbers and saving them to a datatable
+      'but is more efficient than saving the string input to a datatable
+      If DiagFileName <> "" Then
+        FileHandle = FileOpen (DiagFileName,"a+b",-1)
+        FileWrite (FileHandle,Replace (Public.Timestamp(4,1)," ",",") & "," & SUNAInString & CHR(13) & CHR(10),0)
+        FileClose (FileHandle)
+      EndIf
+
+      'take action on light or dark frames (LF/DF)
+      Select Case Left(SUNAInString,6)
+      Case "SATSLF"
+        'light data, parse it
+        SplitStr (SunaInVals,SUNAInString,",",FrameLen,0)
+
+        If SUNAVersion = 1 Then
+          dest(17)= SunaInVals(1)'this is the serial number
+          'dest() = SunaInVals(2)
+          NO3(z) = SunaInVals(4)
+          NO3_fit(z) = SunaInVals(5)
+          dest(12) = SunaInVals(6)
+          dest(11)= SunaInVals(7)
+          Dest(13) = SunaInVals(8)
+          dest(14)= SunaInVals(9)
+          dest(10) = SunaInVals(13)
+          dest(9) = SunaInVals(14)
+          dest(16) = SunaInVals(10)
+          dest(15) = SunaInVals(12)
+          dest(7)  = SunaInVals(90)'RAW A/D detector counts for 254 nm
+          dest(8)  = SunaInVals(209)'RAW A/D detector counts for 350 nm
+
+        ElseIf SUNAVersion = 2 Then
+          'TODO: THERE ARE NOT 17 VALUES HERE - WHAT TO DO?
+
+          dest(17) = SunaInVals(1)'this is the no3 sensors serial number
+          NO3(z) = SunaInVals(5) 'mg/L No3-N
+          dest(7)  = SunaInVals(6)   'absorbance at 254 nm
+          dest(8)  = SunaInVals(7) 'absorbance at 350 nm
+          dest(10) = SunaInVals(9)
+          dest(11) = SunaInVals(269)
+          dest(12) = SunaInVals(270)
+          dest(13) = SunaInVals(271)
+          dest(14)= SunaInVals(272)
+          dest(15) = SunaInVals(273)
+          dest(16) = SunaInVals(274)
+          NO3_fit(z) = SunaInVals(281)
+        EndIf
+
+        'move the split data array into the vector
+        Move (SunaVector(z,1),FrameLen,SunaInVals(1),FrameLen)
+
+        'increment pointer to next message
+        z = z+1
+        If z > SUNA_MEASNUM Then ExitFor
+
+      Case "SATSDF"
+        'do nothing with the dark data yet.....
+      EndSelect
+
+    EndIf
+  Next t
+
+  SerialOut (ComPort,StopCmd + CHR(13) + CHR(10),"",3,100)'stop sensor
+
+  'Alternatively, I guess we conditionally call the processing (AvgSpa, etc.) based on the variable "z".
+
+  If z < SUNA_MEASNUM Then
+    'set quality flag to register all data is bad
+    Quality=255
+    dest() = NAN 'set output date to NANS
+  Else
+    'do processing and output
+
+    'Calculate stats
+    AvgSpa (NO3_ave,SUNA_AVGNUM,NO3(SUNA_MEASNUM-SUNA_AVGNUM))
+    AvgSpa (NO3_fit_ave,SUNA_AVGNUM,NO3_fit(SUNA_MEASNUM-SUNA_AVGNUM))
+    StdDevSpa (NO3_stdev,SUNA_AVGNUM,NO3(SUNA_MEASNUM-SUNA_AVGNUM))
+    StdDevSpa (NO3_fit_stdev,SUNA_AVGNUM,NO3_fit(SUNA_MEASNUM-SUNA_AVGNUM))
+    SortSpa(NO3_sort(),SUNA_AVGNUM,NO3(SUNA_MEASNUM-SUNA_AVGNUM))
+    SortSpa(NO3_fit_sort(),SUNA_AVGNUM,NO3_fit(SUNA_MEASNUM-SUNA_AVGNUM))
+
+    'get median - average middle 2 numbers if swath is even, use middle number if swath is odd
+    If SUNA_AVGNUM MOD 2 = 0 Then
+      'avgnum is even
+      'average the middle two numbers of the swath
+      NO3_med = (NO3_sort(SUNA_AVGNUM/2) + NO3_sort((SUNA_AVGNUM/2)+1)) / 2
+      NO3_fit_med = (NO3_sort(SUNA_AVGNUM/2) + NO3_sort((SUNA_AVGNUM/2)+1)) / 2
+    Else
+      'avgnum is odd
+      'just take the middle number
+      NO3_med = NO3_sort(Ceiling(SUNA_AVGNUM/2))
+      NO3_fit_med = NO3_sort(Ceiling(SUNA_AVGNUM/2))
+    EndIf
+    NO3_CV=NO3_stdev/NO3_ave*100
+    NO3_mean2med=NO3_ave/NO3_med
+
+    'Calculate a measurement quality number
+    'Each bit in the number has a different meaning
+    'See the following chart:
+    'bit, integer, flag
+    '00, 01, <low_soft
+    '01, 02, >high_soft
+    '02, 04, <low_hard
+    '03, 08, >high_hard
+    '04, 16, <cv_low
+    '05, 32, >cv_high
+    '06, 64, med = 0
+    Quality = 0
+    If (NO3_ave - SUNA_OFFSET)<NO3_LOW_SOFT Then Quality += 1
+    If (NO3_ave - SUNA_OFFSET)>NO3_HIGH_SOFT Then Quality += 2
+    If (NO3_ave - SUNA_OFFSET)<NO3_LOW_HARD Then Quality += 4
+    If (NO3_ave - SUNA_OFFSET)>NO3_HIGH_HARD Then Quality +=8
+    If NO3_CV<NO3_CV_LOW Then Quality += 16
+    If NO3_CV>NO3_CV_HIGH Then Quality += 32
+    If NO3_fit_med>NO3_FIT_HIGH Then Quality += 64
+    If NO3_med=0 Then Quality += 128
+
+    'accumulate data and pass through sub as dest
+    dest(1) = NO3_ave
+    dest(2) = NO3_stdev
+    dest(3) = NO3_med
+    dest(4) = NO3_fit_ave
+    dest(5) = NO3_fit_stdev
+    dest(6) = NO3_fit_med
+
+  EndIf
+EndSub
+
+'Main Program
+BeginProg
+  'Init SUNA no3 Qa/Qc params -  change these to suit your site/needs
+  NO3_CV_LOW=.1'%
+  NO3_CV_HIGH=10'%
+  NO3_LOW_HARD=-0.028
+  NO3_LOW_SOFT=0.014'0
+  NO3_HIGH_SOFT=2.5
+  NO3_HIGH_HARD=3.5'3.5 mg/L
+  NO3_FIT_HIGH = 0.01'RMSE
+
+  Scan (SampleInterval,min,0,0)
+    PanelTemp (PTemp,250)  
+    Battery (batt_volt)
+
+    SW12(1)'turn on suna
+    Delay(1,Port3_start_delay,sec)'wait for suna to be in the right mode (booted up, etc.)
+    If UpperCase(Port3_Mode) = "SUNAV1"
+      Call SUNA(Port3_SUNA_data,Port3_SUNA_Quality,Port3_ComPort,1,"CRD:SUNA_" & Left(Public.Timestamp(4,1),10) & ".csv")
+      'If Port3_SUNA_Quality > 0 AND NO3_flag Then Port3_SUNA_data() = NAN
+    ElseIf UpperCase(Port3_Mode) = "SUNAV2"
+      Call SUNA(Port3_SUNA_data,Port3_SUNA_Quality,Port3_ComPort,2,"CRD:SUNA_" & Left(Public.Timestamp(4,1),10) & ".csv")
+      'If Port3_SUNA_Quality > 0 AND NO3_flag Then Port3_SUNA_data() = NAN
+    EndIf
+    SW12(0)'turn of SUNA
+
+  NextScan
+EndProg
+
